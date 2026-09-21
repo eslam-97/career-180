@@ -28,6 +28,7 @@ reasoning behind a decision is unclear.
 6. **Do not add anything not in the doc.** No API routes, no auth beyond the Filament
    panel, no notifications, no extra models, no caching layer.
 7. **Largest remainder is applied to magnitudes, never signed values.**
+8. Every file in app/Domain/ starts with declare(strict_types=1). Money is always `int`.
 
 ## Definition of done for any slice
 

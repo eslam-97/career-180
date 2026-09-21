@@ -1,4 +1,5 @@
 <?php
+
 // Invariants 18, 20, 21, 22, 24, 27 — ARCHITECTURE.md §10.2, §10.6, §10.7, §11
 
 it('inv-18: at most one attempt per payout is in a non-terminal state')

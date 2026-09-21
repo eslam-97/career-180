@@ -1,4 +1,5 @@
 <?php
+
 // Invariants 30, 31, 32 — ARCHITECTURE.md §11.1, §11.2, §16.3
 
 it('inv-30: an attempt past its lease resolves by status query, never by resending')

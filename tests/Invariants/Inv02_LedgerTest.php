@@ -1,4 +1,5 @@
 <?php
+
 // Invariants 3, 4, 5, 6 — ARCHITECTURE.md §1.1, §10.5, §12
 
 it('inv-03: recognized equals available plus reserved plus paid')

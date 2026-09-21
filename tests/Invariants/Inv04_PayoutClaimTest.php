@@ -1,4 +1,5 @@
 <?php
+
 // Invariants 17, 25, 28, 29, 33 — ARCHITECTURE.md §10.1, §10.4
 
 it('inv-17: a visible payout always has a positive amount')

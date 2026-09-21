@@ -2,6 +2,7 @@
 
 namespace Tests\Concurrency;
 
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -36,7 +37,7 @@ trait TwoConnections
             $fn();
 
             return false;
-        } catch (\Illuminate\Database\QueryException $e) {
+        } catch (QueryException $e) {
             return str_contains($e->getMessage(), '1205')
                 || str_contains(strtolower($e->getMessage()), 'lock wait timeout');
         }

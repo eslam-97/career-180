@@ -1,4 +1,5 @@
 <?php
+
 // Invariants 13, 14, 15, 16, 26 — ARCHITECTURE.md §6.2, §12
 
 it('inv-13: the watermark only moves forward and a covered target posts nothing')
