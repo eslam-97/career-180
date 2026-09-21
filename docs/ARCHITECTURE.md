@@ -138,6 +138,10 @@ A ledger row carries three dates with three distinct jobs:
 | `recognized_through_at` | **the recognition horizon this row accounts for** | the watermark (§6.2) |
 | `effective_at` | **business-effective instant, used for payout eligibility** | the underlying business event |
 
+Every table also has `created_at` — when the row was written. It is **audit only**: it
+appears in no calculation and no query filter. The claim predicate uses `effective_at` and
+`id` precisely because `created_at` is wall-clock time and not safe to replay against (§10.1).
+
 Worked example — a refund dated 15 March, processed 3 April, watermark at 31 March:
 
 ```
@@ -1262,7 +1266,8 @@ ledger_entries
 instructor_balances                     -- the per-instructor serialisation point (§9.4)
     instructor_id PK,
     recognized_minor SIGNED, available_minor SIGNED,
-    reserved_minor, paid_minor,
+    reserved_minor UNSIGNED, paid_minor UNSIGNED,   -- never legitimately negative; a bug
+                                                    -- that tries fails the transaction
     recognized_through_at NULL          -- operational cursor (§12, level three)
 
 payout_batches
@@ -1302,6 +1307,33 @@ many NULLs in a unique index. Releases use the posting-period key, so there can 
 one release row per instructor per posting period. Corrections and adjustments use the
 triggering event, so multiple corrections from different events remain distinct while the
 same event processed twice cannot duplicate.
+
+**On timestamps.** Every table has `created_at`. `updated_at` exists only on tables whose
+rows change state — `subscriptions`, `subscription_payments`, `refunds`,
+`instructor_balances`, `payout_batches`, `payouts`, `payout_attempts`,
+`reconciliation_alerts`. `revenue_allocations` has no `updated_at` because its rows are
+never edited. `ledger_entries` has none either: its amount, type and dates are never
+edited, and the one column that does change — `payout_id`, the claim stamp — has its
+history recorded on `payouts` and `payout_attempts`, not on the ledger row.
+
+**On status and kind columns.** Where §14 lists a value set in a comment, the column is a
+MySQL `ENUM` of exactly those values: `payouts.status`, `payout_attempts.status`,
+`refunds.kind`, `reconciliation_alerts.kind`. Enforcement depends on strict SQL mode, which
+stays on (`'strict' => true`). `ledger_entries.type` is deliberately **`VARCHAR`**, not
+`ENUM`: the payable set is enforced by the allowlist in the claim query (§10.1), and
+invariant 29 must be able to insert a non-payable type to prove that allowlist works.
+Status columns whose values this document does not specify are `VARCHAR`.
+
+**On foreign keys.** Every column that references a table which exists gets a foreign key:
+`subscription_payments.subscription_id`, `refunds.payment_id`,
+`revenue_allocations.payment_id`, `payouts.batch_id`, `payout_attempts.payout_id`, and
+`ledger_entries.payout_id` (nullable — a NULL skips the check). All are `RESTRICT`. **No
+cascading deletes, ever**: money rows are never deleted, and a cascade is the one way a
+single statement could silently remove ledger history. `instructor_id` and `student_id`
+have no parent table in this scope and carry no foreign key. The implicit shared locks
+InnoDB takes on parent rows do not conflict with §9.4, because every transaction that
+writes a child row already holds the lock on its parent (the balance row, or the payout row
+it just created or locked).
 
 **On CHECK constraints and generated columns.** CHECK is enforced from MySQL 8.0.16; `STORED`
 generated columns with unique indexes from 5.7. Where the deployment target predates 8.0.16,
