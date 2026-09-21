@@ -77,6 +77,7 @@ function validPaymentRow(int $subscriptionId, array $overrides = []): array
         'subscription_id' => $subscriptionId,
         'amount_minor' => 35_000,
         'currency' => 'EGP',
+        'instructor_ids' => '[3,7,12]',
         'platform_rate_bps' => 2_000,
         'platform_cut_minor' => 7_000,
         'term_start' => '2026-01-01 00:00:00',
@@ -259,6 +260,34 @@ describe('subscription_payments', function () {
         rejectsWith(ERR_CHECK, fn () => DB::table('subscription_payments')->insert(
             validPaymentRow($this->subscriptionId, ['platform_cut_minor' => 35_001])
         ));
+    });
+
+    it('rejects a payment that names no instructors', function () {
+        // §5.2: the split is across the instructors the subscription grants
+        // access to, frozen at payment time. An empty set would leave the whole
+        // instructor pool unallocated and break invariant 1, so the database
+        // refuses it rather than the allocation job discovering it later.
+        rejectsWith(ERR_CHECK, fn () => DB::table('subscription_payments')->insert(
+            validPaymentRow($this->subscriptionId, ['instructor_ids' => '[]'])
+        ));
+    });
+
+    it('rejects an instructor set that is not a JSON array', function () {
+        // JSON_LENGTH alone would accept an object — {"a":1} has length 1 — so
+        // the type half of the CHECK is load-bearing, not decoration.
+        rejectsWith(ERR_CHECK, fn () => DB::table('subscription_payments')->insert(
+            validPaymentRow($this->subscriptionId, ['instructor_ids' => '{"3": 1}'])
+        ));
+    });
+
+    it('accepts a single-instructor payment', function () {
+        // The boundary on the other side: one instructor takes the whole pool,
+        // which §5.5 handles as a one-way largest-remainder split.
+        DB::table('subscription_payments')->insert(
+            validPaymentRow($this->subscriptionId, ['instructor_ids' => '[3]'])
+        );
+
+        expect(DB::table('subscription_payments')->count())->toBe(1);
     });
 });
 

@@ -257,6 +257,12 @@ Snapshotted onto the payment and its allocations, never recomputed:
 - `revenue_allocations.amount_minor` — the canonical entitlement
 - `revenue_allocations.weight_numerator` / `weight_denominator` — the rule, for audit
 - `subscription_payments.platform_rate_bps`, `platform_cut_minor`
+- `subscription_payments.instructor_ids` — which instructors share this payment, fixed at
+  initiate. The allocation job reads it from the payment, never from its own queue payload,
+  so a lost job can be re-dispatched from the database alone. `payments:allocate-missing`
+  does exactly that on a schedule: it finds confirmed payments with no allocation rows and
+  dispatches the job again. Safe to run any number of times, because of
+  `UNIQUE(payment_id, instructor_id)`
 
 Freezing the rate means a later change from 20% to 25% cannot silently rewrite historical
 figures — and it is a precondition for §8, where the platform share is *derived* from the
@@ -717,6 +723,14 @@ settlement       lock balance → lock payout → resolve attempt → update bal
 failure          lock balance → lock payout → check attempts → un-stamp → update balance
 ```
 
+**Allocation is outside this rule.** It writes only `revenue_allocations`, and every value it
+reads — the payment's amount, rate and instructor set — is frozen and never changes. There is
+no unlocked read that a write depends on, so there is nothing to serialise;
+`UNIQUE(payment_id, instructor_id)` is the whole guard. What allocation *does* do is make
+sure each instructor has a balance row, using an insert-if-missing in ascending
+`instructor_id` order (ascending, so two allocations can never deadlock on each other). The
+release job's `FOR UPDATE` needs that row to exist — a lock on a missing row locks nothing.
+
 Contention is per-instructor and the critical sections are short, so this costs nothing at
 the stated scale — the release job is chunked by instructor and never holds more than one
 such lock at a time. Batch-level reads that only decide *which* instructors to dispatch
@@ -1102,6 +1116,7 @@ listed in §19 rather than claimed as solved.
 | Situation | System behaviour | Money outcome |
 |---|---|---|
 | Command run twice | second violates `UNIQUE(batch_id, instructor_id)` | one payout |
+| Allocation job lost after payment confirmed | `payments:allocate-missing` re-dispatches from the frozen `instructor_ids` | allocated exactly once |
 | Two servers concurrently | balance lock serialises; claim affects zero rows | one payout |
 | Two release runs, different targets | balance lock; second reads `posted` under it | no over-recognition |
 | Missed release run executed late | watermark guard makes it a no-op | catch-up not reversed |
@@ -1132,7 +1147,21 @@ listed in §19 rather than claimed as solved.
 
 ## 12. Reconciliation
 
-Three checks, catching different classes of bug.
+Four checks, catching different classes of bug. Money passes through four links — payment,
+allocations, ledger, balance cache — and each check covers one link.
+
+**Level zero — every confirmed payment is fully allocated.**
+
+```
+for every confirmed payment:
+    SUM(revenue_allocations.amount_minor) + platform_cut_minor  ==  amount_minor
+```
+
+§5.1's single transaction means a partial allocation set cannot arise, and
+`AllocationService` refuses one loudly if it ever finds it. But `payments:allocate-missing`
+only picks up payments with *no* allocations, so without this check a partial set created by
+a bug or a manual edit would sit unnoticed. This is invariant 1, checked against live data
+instead of only in tests.
 
 **Level one — the cache agrees with the ledger.**
 
@@ -1174,7 +1203,7 @@ The stored watermark is an **operational cursor** used for concurrency control (
 ledger remains the audit truth. This check is what keeps the cursor honest — a cursor that has
 drifted ahead of the ledger would silently suppress legitimate release runs.
 
-All three run as a scheduled `reconcile:balances` command that fails loudly rather than
+All four run as a scheduled `reconcile:balances` command that fails loudly rather than
 repairing silently. A materialised balance with no drift detector is a materialised balance
 that will eventually be wrong without anyone noticing.
 
@@ -1227,6 +1256,7 @@ subscriptions
 subscription_payments
     id, subscription_id, amount_minor UNSIGNED, currency,
     platform_rate_bps SMALLINT UNSIGNED, platform_cut_minor UNSIGNED,   -- frozen
+    instructor_ids JSON NOT NULL,       -- sorted distinct ids, frozen at initiate (§5.3)
     term_start, term_end,
     client_idempotency_key, provider, provider_reference NULL,
     status, paid_at
@@ -1235,6 +1265,8 @@ subscription_payments
     CHECK (amount_minor > 0)
     CHECK (platform_rate_bps <= 10000)
     CHECK (platform_cut_minor <= amount_minor)
+    CHECK (JSON_TYPE(instructor_ids) = 'ARRAY' AND JSON_LENGTH(instructor_ids) > 0)
+                                        -- no instructors = unallocated pool = inv 1 broken
 
 refunds
     id, payment_id, amount_minor UNSIGNED, kind, reason,
@@ -1299,7 +1331,7 @@ payout_attempts
 reconciliation_alerts
     id, kind, subject_type, subject_id, detail, detected_at, resolved_at NULL
     -- kind: late_success_on_failed_payout | bucket_mismatch
-    --     | watermark_drift | ledger_mismatch
+    --     | watermark_drift | ledger_mismatch | allocation_mismatch
 ```
 
 **On `source_ref`.** `NOT NULL` with a deterministic value precisely because MySQL permits

@@ -26,6 +26,9 @@ class SubscriptionPaymentFactory extends Factory
             'subscription_id' => Subscription::factory(),
             'amount_minor' => $amount,
             'currency' => 'EGP',
+            // §5.5 worked example: 28,000 across these three ids is
+            // 9,334 / 9,333 / 9,333, the leftover piastre going to the lowest.
+            'instructor_ids' => [3, 7, 12],
             // §5.3: the rate and the cut are snapshotted, never recomputed.
             'platform_rate_bps' => $bps,
             // §5.4: derived through Bps so a factory row can never contradict

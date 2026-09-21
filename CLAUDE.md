@@ -13,15 +13,18 @@ reasoning behind a decision is unclear.
 
 ## Hard rules — violations are bugs, not style
 
-1. **Never modify, weaken, skip or delete a test to make it pass.** If a test looks wrong,
-   stop and ask. Changing an assertion to match the code is the single worst thing you can
-   do in this repo.
+1. **Never weaken a test to make it pass.** Filling in a `->todo()` with the assertions its
+   comment describes is expected. Adding a required fixture value after a schema change is
+   fine. But once a test has passed, its assertions never change, and a test is never
+   skipped or deleted. If a test looks wrong, stop and ask.
 2. **Never change a decision in ARCHITECTURE.md.** Not to simplify, not to make a test
    easier, not because a constraint looks redundant.
 3. **All money is integer minor units (piastres).** No floats. No `round()`. No decimal
    division. Anywhere. Rates are basis points (`SMALLINT`), never decimals.
-4. **Every money-moving transaction locks `instructor_balances` FOR UPDATE first** (§9.4).
-   This looks redundant in single-threaded tests. It is not. Do not remove it.
+4. **Every transaction that reads or writes an instructor's ledger entries, payouts or
+   attempts locks `instructor_balances` FOR UPDATE first** (§9.4). This looks redundant in
+   single-threaded tests. It is not. Do not remove it. Allocation is the one exception: it
+   takes no lock, and creates any missing balance row with insertOrIgnore instead.
 5. **Never put a side effect inside `DB::transaction()`** — no dispatch, no HTTP call, no
    event. The closure retries on deadlock and would fire them twice. Dispatch with
    `->afterCommit()`.
