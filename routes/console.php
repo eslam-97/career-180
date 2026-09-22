@@ -14,3 +14,17 @@ Artisan::command('inspire', function () {
 Schedule::command('payments:allocate-missing')
     ->everyFiveMinutes()
     ->withoutOverlapping();
+
+// §6.4: recognition is computed daily but POSTED monthly, so the release runs
+// once a month and closes the period that just ended. withoutOverlapping() is
+// belt to the command's own Cache::lock; the guarantees are the watermark guard
+// (§6.2, Hazard B) and UNIQUE(instructor_id, type, source_ref).
+Schedule::command('release:run')
+    ->monthlyOn(1, '02:00')
+    ->withoutOverlapping();
+
+// §12: a materialised balance with no drift detector is a materialised balance
+// that will eventually be wrong without anyone noticing. Detects, never repairs.
+Schedule::command('reconcile:balances')
+    ->dailyAt('03:00')
+    ->withoutOverlapping();

@@ -432,9 +432,11 @@ TRANSACTION
     posted = Σ (release + release_correction) for this instructor     (§1.1)
     delta  = expected(t) − posted
 
-    delta != 0  →  INSERT ledger entry (release | release_correction)
-                     source_ref = 'period:…' | 'refund:…'
-                     recognized_through_at = t
+    delta == 0  →  COMMIT, post nothing, watermark unchanged
+
+    INSERT ledger entry (release | release_correction)
+        source_ref = 'period:…' | 'refund:…'
+        recognized_through_at = t
 
     UPDATE instructor_balances
        SET recognized_minor = recognized_minor + delta,
@@ -443,6 +445,12 @@ TRANSACTION
      WHERE instructor_id = :iid
 COMMIT
 ```
+
+**The watermark only moves when a row is posted.** That keeps it equal to the newest row's
+`recognized_through_at` (invariant 16). Advancing it on a zero-delta run would put the cursor
+ahead of the ledger — permanently, for any instructor whose terms have all finished. Leaving
+it behind is safe: a zero delta at `T` means nothing new was recognized between `W` and `T`,
+so any late run for a date in that window also computes zero.
 
 Both the `posted` read and the watermark read happen under the lock, which is what
 Hazard A below requires. The job is chunked by instructor and holds one such lock at a
@@ -1162,6 +1170,10 @@ for every confirmed payment:
 only picks up payments with *no* allocations, so without this check a partial set created by
 a bug or a manual edit would sit unnoticed. This is invariant 1, checked against live data
 instead of only in tests.
+
+It skips payments confirmed in the **last hour**. A payment confirmed a minute before the
+nightly run has no allocations yet only because its job has not run — flagging it would be a
+false alarm, and a check that raises false alarms is a check people learn to ignore.
 
 **Level one — the cache agrees with the ledger.**
 

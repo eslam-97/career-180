@@ -14,6 +14,12 @@
         <testsuite name="Invariants">
             <directory>tests/Invariants</directory>
         </testsuite>
+        <!-- ARCHITECTURE.md 16.2: concurrency needs real concurrency. These run
+             two real connections against MySQL and must not be picked up by
+             Pest discovery alone, or CI would never execute them. -->
+        <testsuite name="Concurrency">
+            <directory>tests/Concurrency</directory>
+        </testsuite>
     </testsuites>
     <source>
         <include>
