@@ -1128,6 +1128,12 @@ Resolving `unresolved → failed` by human judgement is an assertion about evide
 the system. It is permitted, it is recorded with that evidence, and low-rate polling continues
 indefinitely afterwards so a contradicting success is detected rather than lost.
 
+Concretely: the human resolution moves the **payout** to `failed`, but the **attempt** stays
+`unresolved` with its `resolution_evidence`. `payouts:poll-open`, scheduled hourly, polls every
+attempt in `unknown` or `unresolved`. That keeps an unresolved attempt under watch after a human
+has ruled on it — which is how invariant 22's late success is ever detected — and it also
+recovers a lost poll job for an `unknown` attempt.
+
 ### 11.3 Two layers of protection, both required
 
 | Layer | Covers |
@@ -1153,6 +1159,7 @@ listed in §19 rather than claimed as solved.
 | Command run twice | second violates `UNIQUE(batch_id, instructor_id)` | one payout |
 | Allocation job lost after payment confirmed | `payments:allocate-missing` re-dispatches from the frozen `instructor_ids` | allocated exactly once |
 | Two servers concurrently | balance lock serialises; claim affects zero rows | one payout |
+| Claim job lost | re-run `payouts:run`; it reuses the period's batch and frozen snapshot | paid in the same batch |
 | Two release runs, different targets | balance lock; second reads `posted` under it | no over-recognition |
 | Missed release run executed late | watermark guard makes it a no-op | catch-up not reversed |
 | Two workers claiming attempt #2 | payout lock; loser aborts without incrementing | one attempt in flight |
@@ -1344,6 +1351,8 @@ instructor_balances                     -- the per-instructor serialisation poin
 
 payout_batches
     id, period_start, period_end, cutoff_at, max_entry_id, status
+    UNIQUE(period_start, period_end)    -- one batch per period; re-running reuses it
+    -- status: 'open' only. Informational; nothing reads or gates on it.
 
 payouts
     id, batch_id, instructor_id,
@@ -1521,6 +1530,12 @@ send(key)
 status(key)
     return the stored result, or UNKNOWN if still unresolved
 ```
+
+**Where the map lives.** A `fake_provider_transfers` table, written by the two fake provider
+classes only, through the query builder. It is the pretend payment company's own storage, not
+part of the schema in §14. It has to be a table rather than an in-memory array because the
+demo runs the queue worker in a separate process: with an array, a replayed key in that
+process would send twice — the exact behaviour the fake exists to rule out.
 
 This buys two tests that were otherwise only asserted in prose: that a replayed key produces no
 second transfer (the provider-side layer of §11.3), and that our system converges on the right

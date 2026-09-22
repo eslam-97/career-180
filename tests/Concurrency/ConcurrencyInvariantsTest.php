@@ -2,9 +2,16 @@
 
 // Invariants 12, 19, 23 — ARCHITECTURE.md §6.2 Hazard A, §9.4, §10.2, §10.6
 
+use App\Domain\Payout\AttemptService;
+use App\Domain\Payout\SettlementService;
+use App\Domain\Provider\Outcome;
 use App\Domain\Recognition\ReleaseService;
 use App\Models\InstructorBalance;
+use App\Models\LedgerEntry;
+use App\Models\Payout;
+use App\Models\PayoutAttempt;
 use Tests\Concurrency\TwoConnections;
+use Tests\Support\PayoutFixtures;
 use Tests\Support\RecognitionFixtures;
 
 uses(TwoConnections::class);
@@ -184,7 +191,29 @@ it('inv-12b: two release runs with different targets do not over-recognize', fun
         ->toBe('2026-04-30 00:00:00');
 });
 
-it('inv-19: attempt_count increments only when the slot is acquired')
+/**
+ * A payout whose attempt #1 is over, so two workers are racing for #2 — the
+ * situation §9.1 names ("two workers creating attempt #2 concurrently") and
+ * §11.4 summarises as "payout lock; loser aborts without incrementing".
+ */
+function attemptRacePayout(int $instructorId): Payout
+{
+    $payout = PayoutFixtures::claimedPayout($instructorId, 300);
+    $first = PayoutFixtures::acquire($payout);
+
+    // Terminal, so active_payout_id generates NULL and the slot is genuinely
+    // available to whichever worker gets there first.
+    PayoutFixtures::forceAttemptStatus($first->id, 'failed');
+
+    return $payout;
+}
+
+function attemptCount(int $payoutId): int
+{
+    return (int) Payout::query()->findOrFail($payoutId)->attempt_count;
+}
+
+it('inv-19: attempt_count increments only when the slot is acquired', function () {
     // A acquires the slot for payout #500 and holds the transaction open
     // (attempt 2 created, status 'sending').
     // B tries to acquire the slot on connection B.
@@ -193,9 +222,122 @@ it('inv-19: attempt_count increments only when the slot is acquired')
     //
     // The counter must not be burned by the loser. If it reaches 3, the gate is
     // relying on the unique constraint instead of doing the work itself (§10.2).
-    ->todo();
+    $instructor = 71;
 
-it('inv-23: settlement and failure move the balance exactly once when replayed')
+    $payout = attemptRacePayout($instructor);
+
+    expect(attemptCount($payout->id))->toBe(1);
+
+    // Prime B first: connB() is what sets innodb_lock_wait_timeout = 1 on that
+    // session, so a genuine block surfaces in a second instead of sitting on
+    // MySQL's 50-second default. AttemptService('mysql_b') then reuses the same
+    // connection instance, session variable and all.
+    $this->connB();
+
+    $connA = $this->connA();
+
+    // A's transaction wraps the service's own, so its DB::transaction nests as a
+    // savepoint and every row lock it took is still held here.
+    $connA->beginTransaction();
+
+    try {
+        $slot = (new AttemptService('mysql'))->acquire($payout->id);
+
+        expect($slot)->not->toBeNull()
+            ->and($slot->attemptNo)->toBe(2);
+
+        // §9.4: A holds the serialisation point, so nobody else can have it.
+        expect($this->blocks(fn () => $this->connB()
+            ->table('instructor_balances')
+            ->where('instructor_id', $instructor)
+            ->lockForUpdate()
+            ->first()))->toBeTrue();
+
+        // §10.2: "worker B blocks on the locks until A commits". It cannot read
+        // payout_attempts past them, which is exactly why that check is a
+        // current read and not a snapshot read.
+        expect($this->blocks(fn () => (new AttemptService('mysql_b'))->acquire($payout->id)))->toBeTrue();
+    } finally {
+        $connA->commit();
+    }
+
+    // --- and now, with the lock free, B tries again ---
+    //
+    // This is the assertion the invariant is named for. B is refused because a
+    // live attempt exists, and the refusal costs nothing: the counter still reads
+    // 2. If it read 3, the gate would be leaning on UNIQUE(active_payout_id)
+    // instead of doing its own work — the constraint as mechanism and the gate as
+    // backstop, which is the inverse of §10.2.
+    expect((new AttemptService('mysql_b'))->acquire($payout->id))->toBeNull()
+        ->and(attemptCount($payout->id))->toBe(2)
+        ->and((int) $this->connB()->table('payouts')->where('id', $payout->id)->value('attempt_count'))->toBe(2)
+        ->and(PayoutAttempt::query()->where('payout_id', $payout->id)->count())->toBe(2)
+        // §10.2 / invariant 18: one attempt in flight, and it is A's.
+        ->and(PayoutAttempt::query()
+            ->where('payout_id', $payout->id)
+            ->whereIn('status', ['sending', 'unknown'])
+            ->count())->toBe(1);
+});
+
+it('inv-19: an interrupted slot acquisition leaves no attempt and no increment', function () {
+    // The assertion the held-open test above cannot make. There, A's transaction
+    // wraps everything it did, so a §10.2 that incremented in one transaction and
+    // inserted in another would look identical from B until the outer commit.
+    //
+    // Here A is interrupted BETWEEN the two. B holds the gap in
+    // UNIQUE(idempotency_key) where attempt #2's row has to go — and nothing
+    // else, so A still takes both its locks and still passes the gate. A
+    // increments, its INSERT blocks on that gap, and A dies on the lock timeout.
+    // §11.1's "no attempt row exists AND attempt_count was not incremented,
+    // because both are in the same transaction" is the only thing stopping a
+    // burned counter from surviving that.
+    //
+    // Put a commit between the increment and the insert and this test goes red:
+    // attempt_count reads 2 with no attempt to show for it, and the next worker
+    // creates #3. If it does not go red, it is asserting nothing.
+    $instructor = 72;
+
+    $payout = attemptRacePayout($instructor);
+
+    $connA = $this->connA();
+    $connB = $this->connB();
+
+    // A must surface the block as a fast, deterministic exception rather than
+    // sitting on MySQL's 50-second default, the same way connB() does.
+    $connA->statement('SET SESSION innodb_lock_wait_timeout = 1');
+
+    try {
+        $connB->beginTransaction();
+
+        // A locking read on a key that does not exist takes the gap in the
+        // unique index, so A's INSERT waits — and only its insert. B takes no
+        // lock on instructor_balances and none on payouts, which is what keeps
+        // A running all the way to the write.
+        $connB->table('payout_attempts')
+            ->where('idempotency_key', AttemptService::idempotencyKey($payout->id, 2))
+            ->lockForUpdate()
+            ->first();
+
+        expect($this->blocks(fn () => (new AttemptService('mysql'))->acquire($payout->id)))->toBeTrue();
+    } finally {
+        $connB->rollBack();
+        $connA->statement('SET SESSION innodb_lock_wait_timeout = 50');
+    }
+
+    expect(attemptCount($payout->id))->toBe(1)
+        ->and(PayoutAttempt::query()->where('payout_id', $payout->id)->count())->toBe(1)
+        ->and(PayoutAttempt::query()->where('payout_id', $payout->id)->where('attempt_no', 2)->exists())->toBeFalse();
+
+    // §10.7: nothing is stranded by that — the slot is still there to be taken,
+    // and the next attempt is #2, not #3.
+    $slot = (new AttemptService('mysql'))->acquire($payout->id);
+
+    expect($slot)->not->toBeNull()
+        ->and($slot->attemptNo)->toBe(2)
+        ->and(attemptCount($payout->id))->toBe(2);
+});
+
+it('inv-23: settlement and failure move the balance exactly once when replayed', function () {
     // Settle a payout. Record the balance buckets.
     // Replay the exact same settlement call (same payout, same attempt).
     // Assert reserved and paid are UNCHANGED — the balance update is gated on the
@@ -203,4 +345,61 @@ it('inv-23: settlement and failure move the balance exactly once when replayed')
     //
     // Repeat for the failure path: fail a payout, replay, assert reserved and
     // available are unchanged and entries are not un-stamped twice.
-    ->todo();
+    $settledInstructor = 73;
+    $failedInstructor = 74;
+
+    $settlement = new SettlementService('mysql');
+
+    // The replays go through a SECOND connection on purpose: a job retried on
+    // another worker is the case this has to survive, and a replay on the same
+    // connection could ride on state that worker happens to still hold.
+    $replay = new SettlementService('mysql_b');
+
+    // --- settlement ---
+    $payout = PayoutFixtures::claimedPayout($settledInstructor, 300);
+    $slot = PayoutFixtures::acquire($payout);
+
+    expect($settlement->recordSuccess($slot->id, Outcome::success('txf_a')))->toBeTrue();
+
+    $afterSettlement = PayoutFixtures::buckets($settledInstructor);
+
+    expect($afterSettlement)
+        ->toBe(['recognized' => 300, 'available' => 0, 'reserved' => 0, 'paid' => 300]);
+
+    // §10.6: "a replayed settlement would find status = 'settled', affect zero
+    // rows on the payout, and then still move reserved -> paid a second time if
+    // the cache update ran unconditionally".
+    expect($settlement->recordSuccess($slot->id, Outcome::success('txf_a')))->toBeFalse()
+        ->and($replay->recordSuccess($slot->id, Outcome::success('txf_a')))->toBeFalse()
+        ->and(PayoutFixtures::buckets($settledInstructor))->toBe($afterSettlement)
+        ->and(Payout::query()->findOrFail($payout->id)->status)->toBe('settled')
+        ->and(PayoutAttempt::query()->findOrFail($slot->id)->status)->toBe('succeeded')
+        // §12 level one: the cache still agrees with the ledger.
+        ->and(PayoutFixtures::ledgerBuckets($settledInstructor))->toBe($afterSettlement);
+
+    // --- failure ---
+    $failing = PayoutFixtures::claimedPayout($failedInstructor, 400);
+    $failingSlot = PayoutFixtures::acquire($failing);
+
+    PayoutFixtures::forceAttemptStatus($failingSlot->id, 'failed');
+
+    expect($settlement->failPayout($failing->id))->toBeTrue();
+
+    $afterFailure = PayoutFixtures::buckets($failedInstructor);
+
+    expect($afterFailure)
+        ->toBe(['recognized' => 400, 'available' => 400, 'reserved' => 0, 'paid' => 0]);
+
+    // §10.6: the ledger un-stamp is naturally idempotent (WHERE payout_id = :id);
+    // the balance move is not, which is why it is gated the same way settlement's
+    // is. Un-stamping twice would be harmless; moving the money twice would not.
+    expect($settlement->failPayout($failing->id))->toBeFalse()
+        ->and($replay->failPayout($failing->id))->toBeFalse()
+        ->and(PayoutFixtures::buckets($failedInstructor))->toBe($afterFailure)
+        ->and(Payout::query()->findOrFail($failing->id)->status)->toBe('failed')
+        ->and(LedgerEntry::query()->where('payout_id', $failing->id)->count())->toBe(0)
+        ->and(LedgerEntry::query()->where('instructor_id', $failedInstructor)->whereNull('payout_id')->count())->toBe(1)
+        ->and(PayoutFixtures::ledgerBuckets($failedInstructor))->toBe($afterFailure)
+        // Invariant 4: nothing is left stamped by a failed payout.
+        ->and(PayoutFixtures::orphanedEntries())->toBe(0);
+});

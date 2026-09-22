@@ -2,11 +2,16 @@
 
 // Invariants 3, 4, 5, 6 — ARCHITECTURE.md §1.1, §10.5, §12
 
+use App\Domain\Payout\SettlementService;
+use App\Domain\Provider\Outcome;
+use App\Domain\Provider\Scenario;
 use App\Domain\Recognition\ReleaseCalculator;
 use App\Domain\Recognition\ReleaseService;
+use App\Jobs\SendPayoutAttempt;
 use App\Models\InstructorBalance;
 use App\Models\LedgerEntry;
 use App\Models\Payout;
+use Tests\Support\PayoutFixtures;
 use Tests\Support\RecognitionFixtures;
 
 /**
@@ -144,13 +149,126 @@ it('inv-03: recognized equals available plus reserved plus paid', function () {
     expect($balance->available_minor)->toBeLessThan(0);
 });
 
-it('inv-04: every ledger entry is in exactly one bucket at all times')
+it('inv-04: every ledger entry is in exactly one bucket at all times', function () {
     // Assert no entry is stamped with a payout in a terminal-failed state.
     // Run after: a normal settlement, a failed payout, a rolled-back claim,
     // and a stranded payout swept by §10.7.
     // Also assert the three bucket queries partition the entry set with no overlap
     // and no gaps.
-    ->todo();
+    $settled = 191;
+    $failed = 192;
+    $rolledBack = 193;
+    $stranded = 194;
+    $inFlightInstructor = 195;
+
+    $this->travelTo(RecognitionFixtures::utc('2026-04-01 10:00:00'));
+
+    // §10.7: one attempt allowed, so the definitive failure below exhausts the
+    // ceiling and the payout is failed through §10.6 rather than retried.
+    config()->set('payouts.attempt_ceiling', 1);
+
+    $settlement = new SettlementService;
+    $provider = PayoutFixtures::scripted();
+
+    // 1. A normal settlement: reserved -> paid.
+    $settledPayout = PayoutFixtures::claimedPayout($settled, 300);
+    $slot = PayoutFixtures::acquire($settledPayout);
+    $settlement->recordSuccess($slot->id, Outcome::success('txf_settled'));
+
+    // 2. A failed payout: reserved -> available, entries un-stamped in the same
+    //    transaction (§10.6). This is the state the invariant is really about —
+    //    an entry stamped with a failed payout is in NO bucket at all.
+    $provider->always(Scenario::Failure);
+    $failedPayout = PayoutFixtures::claimedPayout($failed, 400);
+    app()->call([new SendPayoutAttempt($failedPayout->id), 'handle']);
+
+    // 3. A rolled-back claim (§10.4): release +100, correction −150, so the sum
+    //    is negative and the whole transaction is discarded — no payout row, and
+    //    the entries stay exactly where they were.
+    PayoutFixtures::recognize($rolledBack, 100);
+
+    $correction = LedgerEntry::factory()->correction(-150, 'refund:9814')->create([
+        'instructor_id' => $rolledBack,
+    ]);
+
+    InstructorBalance::query()->whereKey($rolledBack)->incrementEach([
+        'recognized_minor' => -150,
+        'available_minor' => -150,
+    ]);
+
+    expect(PayoutFixtures::tryClaim($rolledBack))->toBeNull();
+
+    // 4. A stranded payout — claimed, with its attempt-creation job never having
+    //    landed — swept by §10.7 and carried to settlement.
+    $provider->always(Scenario::Success);
+    $strandedPayout = PayoutFixtures::claimedPayout($stranded, 500);
+
+    expect(Payout::query()->findOrFail($strandedPayout->id)->status)->toBe('pending')
+        ->and($strandedPayout->attempts()->count())->toBe(0);
+
+    $this->artisan('payouts:sweep-stranded')->assertSuccessful();
+
+    expect(Payout::query()->findOrFail($strandedPayout->id)->status)->toBe('settled');
+
+    // 5. And one payout still in flight, so the reserved bucket is not empty
+    //    when the partition below is counted. Claimed after the sweep, because
+    //    the sweeper would otherwise have carried this one to settlement too.
+    $inFlightPayout = PayoutFixtures::claimedPayout($inFlightInstructor, 600);
+    PayoutFixtures::acquire($inFlightPayout);
+
+    expect(Payout::query()->findOrFail($inFlightPayout->id)->status)->toBe('in_progress');
+
+    // --- the invariant, over every entry in the table ---
+
+    // An entry stamped with a failed payout belongs to no bucket: not available
+    // (it has a payout_id), not reserved (the payout is terminal), not paid.
+    // §10.6's single transaction is what makes this count zero.
+    expect(PayoutFixtures::orphanedEntries())->toBe(0);
+
+    $total = LedgerEntry::query()->count();
+
+    $unclaimed = LedgerEntry::query()->whereNull('payout_id')->count();
+
+    $inFlight = LedgerEntry::query()->whereIn('payout_id', Payout::query()
+        ->whereIn('status', ['pending', 'in_progress', 'needs_review'])
+        ->select('id'))->count();
+
+    $paidOut = LedgerEntry::query()->whereIn('payout_id', Payout::query()
+        ->where('status', 'settled')
+        ->select('id'))->count();
+
+    // No gaps: the three queries between them cover every row. No overlap: a row
+    // has one payout_id and a payout has one status, so the counts can only add
+    // up if each row was counted once.
+    expect($total)->toBe(6)
+        ->and($unclaimed + $inFlight + $paidOut)->toBe($total)
+        // The failed payout's entry plus the two the rolled-back claim left
+        // alone; the in-flight payout's entry; the settled and swept ones.
+        ->and($unclaimed)->toBe(3)
+        ->and($inFlight)->toBe(1)
+        ->and($paidOut)->toBe(2);
+
+    // §12 level one, per instructor: the cache agrees with the ledger in every
+    // one of the four states above.
+    foreach ([$settled, $failed, $rolledBack, $stranded, $inFlightInstructor] as $instructorId) {
+        expect(PayoutFixtures::buckets($instructorId))
+            ->toBe(PayoutFixtures::ledgerBuckets($instructorId));
+    }
+
+    expect(PayoutFixtures::buckets($settled))
+        ->toBe(['recognized' => 300, 'available' => 0, 'reserved' => 0, 'paid' => 300])
+        // The failed payout's money is back where it started, in one piece.
+        ->and(PayoutFixtures::buckets($failed))
+        ->toBe(['recognized' => 400, 'available' => 400, 'reserved' => 0, 'paid' => 0])
+        // §10.5: "claim rolled back — none". The cache never moved.
+        ->and(PayoutFixtures::buckets($rolledBack))
+        ->toBe(['recognized' => -50, 'available' => -50, 'reserved' => 0, 'paid' => 0])
+        ->and($correction->fresh()->payout_id)->toBeNull()
+        ->and(PayoutFixtures::buckets($stranded))
+        ->toBe(['recognized' => 500, 'available' => 0, 'reserved' => 0, 'paid' => 500])
+        ->and(PayoutFixtures::buckets($inFlightInstructor))
+        ->toBe(['recognized' => 600, 'available' => 0, 'reserved' => 600, 'paid' => 0]);
+});
 
 it('inv-05: posted release entries match the calculated total at the watermark', function () {
     // SUM(release + release_correction) === sum over allocations of released(alloc, W)

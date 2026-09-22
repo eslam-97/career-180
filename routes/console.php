@@ -36,3 +36,25 @@ Schedule::command('reconcile:balances')
 Schedule::command('payouts:run')
     ->monthlyOn(1, '04:00')
     ->withoutOverlapping();
+
+// §10.7: a payout with money reserved and no attempt in flight. This is both
+// the ordinary road out of the claim and the recovery path for an
+// attempt-creation job the queue dropped — one state-driven predicate covering
+// both. needs_review is excluded by the sweeper's explicit status list.
+Schedule::command('payouts:sweep-stranded')
+    ->everyMinute()
+    ->withoutOverlapping();
+
+// §11.1: an attempt past its lease becomes unknown and is asked about. Never
+// failed, never resent. Frequent, because the lease is the latency floor on
+// recovering a dead worker.
+Schedule::command('payouts:sweep-leases')
+    ->everyMinute()
+    ->withoutOverlapping();
+
+// §11.2: the low-rate poll that continues indefinitely, so an answer arriving a
+// day later — from a settlement file, or a human reading the provider's
+// dashboard — is still recorded rather than dropped.
+Schedule::command('payouts:poll-open')
+    ->hourly()
+    ->withoutOverlapping();

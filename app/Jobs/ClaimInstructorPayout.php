@@ -23,6 +23,14 @@ use Illuminate\Queue\SerializesModels;
  * the frozen snapshot (§10.1), and a job replayed from a stale payload could
  * otherwise claim against a cutoff the batch never had.
  *
+ * §10.3: "COMMIT — then, and only then — acquire slot + create attempt (§10.2),
+ * call provider". The attempt is not dispatched from here. A committed claim is
+ * a payout in `pending` with no attempt and attempt_count 0, which is precisely
+ * the §10.7 sweeper's predicate, so `payouts:sweep-stranded` is what creates the
+ * attempt — for a fresh claim and for a claim whose dispatch was lost alike. One
+ * state-driven path instead of an event-driven one plus a recovery one, and
+ * nothing that depends on this job surviving long enough to queue another.
+ *
  * Deliberately NOT ShouldBeUnique: §9.1 calls the Redis lock an optimisation and
  * the constraint the guarantee. Here the guarantees are the balance lock and
  * UNIQUE(batch_id, instructor_id), neither of which can expire mid-operation.

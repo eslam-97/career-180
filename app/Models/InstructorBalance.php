@@ -6,6 +6,7 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 
 /**
  * §9.4: the per-instructor serialisation point. Every money-moving transaction
@@ -44,5 +45,15 @@ class InstructorBalance extends Model
             // §1.1: the watermark.
             'recognized_through_at' => 'immutable_datetime',
         ];
+    }
+
+    /**
+     * §13: the payout history half of the read model. instructor_id has no
+     * parent table (§14), so the balance row — which IS keyed by it — is the
+     * only place this relation can hang.
+     */
+    public function payouts(): HasMany
+    {
+        return $this->hasMany(Payout::class, 'instructor_id', 'instructor_id');
     }
 }
