@@ -28,3 +28,11 @@ Schedule::command('release:run')
 Schedule::command('reconcile:balances')
     ->dailyAt('03:00')
     ->withoutOverlapping();
+
+// §10.1 / §6.4: recognition is posted monthly, so the payout batch is monthly
+// too and runs after the release has closed the period. withoutOverlapping() is
+// belt to the command's own Cache::lock; the guarantees are the balance lock
+// (§9.4) and UNIQUE(batch_id, instructor_id).
+Schedule::command('payouts:run')
+    ->monthlyOn(1, '04:00')
+    ->withoutOverlapping();

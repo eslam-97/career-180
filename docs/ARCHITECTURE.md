@@ -377,20 +377,35 @@ The trigger for the cap is `access_ends_at`, deliberately distinct from both
 | Cancels auto-renew, term continues | unchanged | **none** | none |
 | Terminated mid-term, prorata refund | ends at refund date | `access_ends_at = refund date` | correction if already over-recognized |
 | Terminated mid-term, full refund | ends | `access_ends_at = starts_at` → `effective_days = 0` | correction claws back everything |
-| Goodwill partial refund, access continues | unchanged | **none** | `refund_adjustment` / counter-allocation *(§19)* |
+| Goodwill partial refund, access continues | unchanged | **none** | none — the platform absorbs it (§7.1); sharing it with instructors is §19 |
 
 Setting `access_ends_at = starts_at` makes a full refund fall out of the existing clamp
-with no new code. Only the goodwill case needs a new mechanism, because it reduces
-entitlement without reducing access — and that is precisely why `refund_adjustment` is
-excluded from `posted` (§1.1).
+with no new code. Only the goodwill case would need a new mechanism to share its cost with
+instructors, because it reduces entitlement without reducing access — and that is precisely
+why `refund_adjustment` is excluded from `posted` (§1.1).
+
+**`access_ends_at` only ever moves earlier.** A refund sets
+`access_ends_at = min(existing, policy result)`. Without this, a full refund followed by a
+prorata refund would move access back out to the prorata date, and the correction would
+re-release — paying instructors again for money the student already got back in full. That
+would break the §6 property that the release job can never pay out refunded money.
+Reinstating access is a different event from a refund, and is out of scope.
 
 `refunds` is a first-class event table (§14). Whether a given refund sets `access_ends_at`
 is a business rule applied by a policy class, not assumed by the ledger, and each `kind`
 has its own test.
 
-A refund event dispatches a **targeted recompute** for the affected instructors rather
-than waiting for the next monthly release run. Otherwise a payout could go out in a window
-where the refund exists but the corresponding correction is not yet in the ledger.
+A refund runs a **targeted recompute inside its own transaction**: insert the refund, apply
+the policy to `access_ends_at`, then call `ReleaseService::correct()` for each instructor on
+the payment, in ascending `instructor_id` order so two refunds can never deadlock. The refund
+and its corrections are saved together or not at all.
+
+Waiting for the next monthly run would leave a window where the refund exists but the
+correction does not, and a payout could pay refunded days. Dispatching the recompute as a
+queued job would narrow that window but not close it — a lost job reopens it with nothing
+to notice. Doing it in the same transaction closes it structurally. It is cheap, because a
+payment has only a handful of instructors. If a correction fails, the refund rolls back and
+the provider's webhook retry delivers it again, so the refund is not lost.
 
 ### 6.2 The release job: cumulative delta, serialised, monotonic
 
@@ -592,6 +607,18 @@ instructor who did nothing wrong. This is the entire payoff of §6.
 > to be the correct representation of the student's remaining financial entitlement. The
 > brief requires sensible treatment of mid-term refunds; it does not mandate this formula,
 > and a different business rule would change `access_ends_at`, not the machinery around it.
+
+**A prorata refund dated outside the term is clamped, not rejected.** A refund is a fact the
+payment provider reports — the money has already left. Refusing to record it would not undo
+it; it would only leave a real refund out of the books. So the policy applies §7.1's own
+rule at its edges: dated after the term ends, nothing was unused and access is effectively
+unchanged; dated before it starts, everything was unused and `access_ends_at = starts_at`.
+The refund row keeps its original `effective_at`; only `access_ends_at` is clamped.
+
+**A goodwill refund is recorded and absorbed by the platform.** Access is unchanged, so
+instructor recognition is unaffected and the whole amount comes out of the platform's share.
+No `access_ends_at` change and no recompute. It is recorded rather than refused for the same
+reason as above.
 
 A consequence worth stating rather than discovering: **when a refund exceeds the unearned
 portion, the excess comes entirely out of the platform share.** Instructor recognition is
@@ -1144,6 +1171,7 @@ listed in §19 rather than claimed as solved.
 | Crash between attempt success and settlement | single transaction (§10.6) | never stranded as reserved |
 | Settlement replayed | payout update affects 0 rows; balance gated on it | no double bucket move |
 | Refund before release | clamp stops recognition | no clawback |
+| Refund recorded, worker lost before its correction ran | correction runs in the refund's own transaction | no window for a payout to pay refunded days |
 | Refund after payout settled | correction → negative available | nets against future |
 | Termination dated before a posted release | `release_correction`, watermark held | ledger corrected |
 | Recognition queried before `starts_at` | `elapsed_days` clamps to 0 | never negative |
@@ -1566,9 +1594,10 @@ Chosen deliberately, not overlooked.
   automatically recoverable** (§11.3). The entries may already belong to a later payout. It is
   detected and alerted, never silently absorbed. Closing it fully would mean holding money
   indefinitely whenever a provider goes silent.
-- **Goodwill refunds with continued access are only partially implemented.** The
-  `refund_adjustment` ledger type and its exclusion from `posted` exist and are tested; the
-  allocator-level counter-allocation that would split such an adjustment across instructors does
+- **Goodwill refunds are absorbed entirely by the platform.** They are recorded, access is
+  unchanged, and instructors are unaffected (§7.1). Sharing the cost with instructors is not
+  implemented: the `refund_adjustment` ledger type and its exclusion from `posted` exist and
+  are tested, but the counter-allocation that would split an adjustment across instructors does
   not. It would share the payment's term and split by frozen `amount_minor` proportions, which
   requires `revenue_allocations.amount_minor` to become signed.
 - **Level-two reconciliation is not independent of the release job** (§12). Mitigated by the
