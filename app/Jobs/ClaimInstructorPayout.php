@@ -24,12 +24,23 @@ use Illuminate\Queue\SerializesModels;
  * otherwise claim against a cutoff the batch never had.
  *
  * §10.3: "COMMIT — then, and only then — acquire slot + create attempt (§10.2),
- * call provider". The attempt is not dispatched from here. A committed claim is
- * a payout in `pending` with no attempt and attempt_count 0, which is precisely
- * the §10.7 sweeper's predicate, so `payouts:sweep-stranded` is what creates the
- * attempt — for a fresh claim and for a claim whose dispatch was lost alike. One
- * state-driven path instead of an event-driven one plus a recovery one, and
- * nothing that depends on this job surviving long enough to queue another.
+ * call provider". This job is where that happens: the claim transaction commits,
+ * and then — outside it, with afterCommit() (§9.2) — the attempt job is queued.
+ * That is the normal path, and the only one that pays an instructor promptly.
+ *
+ * It is dispatched for a payout THIS invocation created, and for nothing else.
+ * A replay finds the batch's existing payout (§11.4) and returns its id, which
+ * says nothing about whether an attempt is already in flight for it; queueing
+ * on that would put a second attempt job behind every rerun of `payouts:run`.
+ * The §10.2 gate would refuse it, but the gate is the backstop, not the
+ * mechanism. ClaimResult carries the answer out of the transaction instead.
+ *
+ * `payouts:sweep-stranded` (§10.7) stays, and stays a RECOVERY mechanism: the
+ * committed payout whose attempt dispatch was lost, the worker that died before
+ * the §10.2 transaction, the retry dispatch that vanished. It is not what
+ * ordinarily creates the attempt, and a design where it is, is a design where
+ * every payout waits a sweeper tick and the recovery path is never exercised
+ * as one.
  *
  * Deliberately NOT ShouldBeUnique: §9.1 calls the Redis lock an optimisation and
  * the constraint the guarantee. Here the guarantees are the balance lock and
@@ -58,6 +69,20 @@ final class ClaimInstructorPayout implements ShouldQueue
             return;
         }
 
-        $claim->claim($this->instructorId, $batch);
+        // §10.3: the id only when this call created the payout. Null covers the
+        // replay (§11.4) and both no-payout cases — nothing eligible, and a
+        // claimed sum of zero or less rolled back (§10.4) — so one branch is
+        // enough and none of the three can start an attempt.
+        $payoutId = $claim->claimResult($this->instructorId, $batch)->createdPayoutId();
+
+        if ($payoutId === null) {
+            return;
+        }
+
+        // §10.3: "COMMIT — then, and only then — acquire slot + create attempt
+        // (§10.2), call provider". §9.2: afterCommit(), and outside any
+        // transaction of ours — a dispatch inside the claim closure would fire
+        // twice on a deadlock retry.
+        SendPayoutAttempt::dispatch($payoutId)->afterCommit();
     }
 }

@@ -8,8 +8,6 @@ A money system. Correctness beats cleverness, features, and speed of delivery.
 deliberately, and most have a named failure case attached. If the code cannot match the
 doc, stop and explain why rather than deviating.
 
-`docs/DESIGN_EXPLAINED.md` is the same content in plain language. Read it when the
-reasoning behind a decision is unclear.
 
 ## Hard rules — violations are bugs, not style
 

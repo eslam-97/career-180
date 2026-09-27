@@ -26,6 +26,12 @@ use Illuminate\Support\Facades\DB;
  *     --- then, and only then ---
  *         acquire slot + create attempt (§10.2), call provider
  *
+ * That last line is ClaimInstructorPayout's, once this transaction has
+ * committed and only for a payout this call actually created — which is why
+ * claimResult() reports the `created` flag out of the transaction itself
+ * (§10.3). `payouts:sweep-stranded` (§10.7) is recovery for a dispatch that was
+ * lost, never the ordinary road out of here.
+ *
  * No provider call happens here, and no lock is ever held across one. The order
  * of the statements below is the contract, not an optimisation.
  */
@@ -56,13 +62,23 @@ final class ClaimService
      */
     public function claim(int $instructorId, PayoutBatch $batch): ?int
     {
+        return $this->claimResult($instructorId, $batch)->payoutId;
+    }
+
+    /**
+     * The same claim, reported in full: the payout id AND whether this call is
+     * what created it. §10.3's attempt dispatch hangs off that second value,
+     * and nothing but the transaction below may decide it (§9.4).
+     */
+    public function claimResult(int $instructorId, PayoutBatch $batch): ClaimResult
+    {
         $db = $this->db();
 
         try {
             // The try wraps the transaction, never its body: DB::transaction()
             // retries its closure on deadlock, and the closure stays pure —
             // reads and writes only, no dispatch, no HTTP call (§9.2).
-            return $db->transaction(function () use ($db, $instructorId, $batch): ?int {
+            return $db->transaction(function () use ($db, $instructorId, $batch): ClaimResult {
                 // §9.4: the instructor_balances row is the per-instructor
                 // serialisation point, and this is the FIRST statement in the
                 // transaction. Every read below it — the existing-payout check,
@@ -76,7 +92,7 @@ final class ClaimService
                 // creates the row; with no row there is no serialisation point,
                 // so nothing may be claimed.
                 if ($balance === null) {
-                    return null;
+                    return ClaimResult::none();
                 }
 
                 // §11.4, "command run twice": one payout per instructor per
@@ -84,13 +100,17 @@ final class ClaimService
                 // that recovers a lost claim job — is a no-op rather than an
                 // auto-increment burn. UNIQUE(batch_id, instructor_id) stays
                 // the guarantee behind it (invariant 25).
+                //
+                // §10.3: reported as `existing`, never `created` — this payout
+                // may already have an attempt in flight, and the caller must
+                // not start a second one for it.
                 $existing = $db->table('payouts')
                     ->where('batch_id', $batch->id)
                     ->where('instructor_id', $instructorId)
                     ->value('id');
 
                 if ($existing !== null) {
-                    return (int) $existing;
+                    return ClaimResult::existing((int) $existing);
                 }
 
                 // §10.4: the id must exist before the entries can be stamped
@@ -172,13 +192,18 @@ final class ClaimService
                         'reserved_minor' => $sum,
                     ], ['updated_at' => $this->now()->format('Y-m-d H:i:s')]);
 
-                return $payoutId;
+                // §10.3: the one branch that inserted a payout and is about to
+                // commit it, so the one branch that may report `created`. The
+                // flag leaves the transaction as its return value — a separate
+                // read outside it would let two concurrent workers both claim
+                // authorship of the same row (§9.4).
+                return ClaimResult::created($payoutId);
             });
         } catch (NonPositiveClaim) {
             // §10.5: "claim rolled back — none. The whole transaction is
             // discarded." There is nothing to undo here, and nothing to report
             // upward but the absence of a payout.
-            return null;
+            return ClaimResult::none();
         }
     }
 

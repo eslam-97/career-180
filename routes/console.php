@@ -37,10 +37,11 @@ Schedule::command('payouts:run')
     ->monthlyOn(1, '04:00')
     ->withoutOverlapping();
 
-// §10.7: a payout with money reserved and no attempt in flight. This is both
-// the ordinary road out of the claim and the recovery path for an
-// attempt-creation job the queue dropped — one state-driven predicate covering
-// both. needs_review is excluded by the sweeper's explicit status list.
+// §10.7: a payout with money reserved and no attempt in flight. RECOVERY ONLY —
+// §10.3's claim job dispatches the attempt itself, so on a healthy queue this
+// sweeps nothing. What it catches is the attempt-creation job the queue dropped
+// or the worker that died before the §10.2 transaction.
+// needs_review is excluded by the sweeper's explicit status list.
 Schedule::command('payouts:sweep-stranded')
     ->everyMinute()
     ->withoutOverlapping();

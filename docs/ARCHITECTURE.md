@@ -892,6 +892,12 @@ COMMIT
 A database lock is never held across a network call. Doing so makes the payout table
 serialise on a third party's tail latency.
 
+**The claim job starts the attempt.** Once the claim transaction commits and a payout exists,
+the claim job dispatches the attempt job with `afterCommit()`. That is the normal path.
+`payouts:sweep-stranded` (§10.7) exists only to recover an attempt-creation job that was lost —
+it must never be the only thing that sends a payment, or every payout waits for the sweeper and
+the recovery path quietly becomes the main one.
+
 ### 10.4 A non-positive claim produces no payout at all
 
 A claimed set can contain both releases and negative corrections, so the sum is not
@@ -1280,7 +1286,12 @@ InstructorResource  (read-only)
       attempts           count, with last provider reference
 ```
 
-Only `pending` is computed on read, and only over that one instructor's allocations.
+Only `pending` is computed on read, and only for that one instructor: a sum over their
+allocations, minus `posted` — a sum over their `release` and `release_correction` rows. The
+second sum reads the ledger, and that is deliberate: `recognized_minor` cannot stand in for
+`posted`, because it also includes `refund_adjustment` (§1.1). It stays cheap because the
+ledger holds one row per instructor per month. The four balance totals are never summed from
+the ledger on read.
 Everything else is a single row lookup or an indexed join. Drill-down to the claimed ledger
 entries of a specific payout is available through `payout_id`, which is the audit path §10.1
 exists to provide.
@@ -1326,6 +1337,8 @@ revenue_allocations
     id, payment_id, instructor_id, amount_minor UNSIGNED,
     weight_numerator UNSIGNED, weight_denominator UNSIGNED
     UNIQUE(payment_id, instructor_id)                  -- immutable
+    INDEX(instructor_id, payment_id, amount_minor)     -- covering index for the release
+                                                       -- job's per-instructor sum (§17)
     CHECK (weight_denominator > 0)
 
 ledger_entries
@@ -1542,8 +1555,11 @@ second transfer (the provider-side layer of §11.3), and that our system converg
 balance when the money moved but the response did not arrive.
 
 `ScriptedProvider` drives outcomes per call for the test suite — no randomness, no flaky
-assertions. `RandomProvider` drives the demo, **seeded**, so a re-recorded demonstration
-produces the same failure sequence.
+assertions — and it is the test default: a `send()` with no scripted outcome throws, so a
+test that sends a payment by accident fails loudly instead of getting a random result.
+The seven named `demo:*` scenarios also use `ScriptedProvider`, because demonstrating a
+named failure needs that exact outcome. `RandomProvider`, **seeded**, drives the free-running
+walkthrough, so a re-recorded demonstration produces the same sequence.
 
 `status()` must itself be able to return `UNKNOWN`, meaning *"I still cannot tell you."* Without
 that, the polling-exhaustion path into `needs_review` is untestable — and so is the
@@ -1561,6 +1577,7 @@ recorded, which exercises the lease path in §11.1 without killing a process.
 | Balance reads over tens of millions of rows | materialised `instructor_balances`, maintained transactionally (§10.5) |
 | Release row volume | aggregated per (instructor, posting period), not per allocation |
 | Release job over 500k subscriptions | grouped aggregate chunked by instructor, `chunkById`, never offset pagination |
+| Per-instructor expected sum | covering `INDEX(instructor_id, payment_id, amount_minor)` on allocations; without it each instructor is a full-table scan |
 | Per-instructor serialisation (§9.4) | one short row lock per instructor; different instructors never contend |
 | Watermark read | a column on the balance row already locked, not an aggregate |
 | Payout fan-out | `Bus::batch` of one job per instructor, bounded concurrency |
@@ -1627,6 +1644,9 @@ Chosen deliberately, not overlooked.
   accident.
 - **No minimum payout threshold.** Production systems use one; per-transfer fees otherwise
   consume dust balances.
+- **The release job re-sums an instructor's whole allocation history every run.** That is what
+  makes it self-healing (§6.2), and the covering index keeps it fast today, but the cost grows
+  with time. Rolling fully-released allocations into a per-instructor total is the next step.
 - **Ledger is unbounded.** No partitioning, archival or rollup strategy. Monthly partitioning on
   `period_start` is the obvious next step.
 - **Per-subscription attribution is not in the ledger** (§6.4). Recoverable by joining

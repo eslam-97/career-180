@@ -6,6 +6,7 @@ use App\Domain\Allocation\EqualSplitAllocator;
 use App\Domain\Allocation\RevenueAllocator;
 use App\Domain\Provider\PaymentProvider;
 use App\Domain\Provider\RandomProvider;
+use App\Domain\Provider\ScriptedProvider;
 use Illuminate\Support\ServiceProvider;
 
 class AppServiceProvider extends ServiceProvider
@@ -21,12 +22,21 @@ class AppServiceProvider extends ServiceProvider
         // it cannot be allocated at payment time at all (§5.2).
         $this->app->bind(RevenueAllocator::class, EqualSplitAllocator::class);
 
-        // §16.3: there is no real payment provider in this scope, so the demo
-        // runs the seeded one — same durable map, same record-then-throw
-        // ordering as the scripted one the suite drives. A singleton because the
-        // seeded sequence is per instance: resolving a new one per job would
-        // replay the same first outcome forever.
-        $this->app->singleton(PaymentProvider::class, RandomProvider::class);
+        // §16.3: "ScriptedProvider drives outcomes per call for the test suite —
+        // no randomness, no flaky assertions. RandomProvider drives the demo,
+        // seeded". Two environments, two defaults, and the suite's is the one
+        // that answers nothing until a test says what it should answer: an
+        // unscripted send throws rather than drawing a random outcome, so a test
+        // that moves money it never meant to move fails on the spot instead of
+        // passing four times in five.
+        //
+        // A singleton either way. The seeded sequence and the script are both
+        // per instance, so resolving a new one per job would replay the first
+        // outcome forever.
+        $this->app->singleton(
+            PaymentProvider::class,
+            $this->app->environment('testing') ? ScriptedProvider::class : RandomProvider::class,
+        );
     }
 
     /**

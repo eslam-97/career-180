@@ -4,9 +4,11 @@
 
 use App\Domain\Payout\BatchService;
 use App\Domain\Payout\ClaimService;
+use App\Jobs\SendPayoutAttempt;
 use App\Models\LedgerEntry;
 use App\Models\Payout;
 use App\Models\PayoutBatch;
+use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\DB;
 use Tests\Support\RecognitionFixtures;
 
@@ -160,6 +162,14 @@ it('inv-25: running the payout command twice creates one payout per instructor',
     // php artisan payouts:run twice for the same batch period.
     // Assert exactly one payout row per instructor.
     // Assert the second run claimed zero ledger entries.
+    //
+    // Setup only: §10.3's claim job now dispatches the attempt, and the queue is
+    // sync here, so without this the run would send through the container's
+    // default RandomProvider and settle the payouts this test is measuring at
+    // rest. A PARTIAL fake — ClaimInstructorPayout still runs for real, because
+    // the claim is the subject.
+    Bus::fake([SendPayoutAttempt::class]);
+
     $first = 42;
     $second = 48;
 
@@ -296,6 +306,11 @@ it('inv-33: a negative balance is cleared by future recognition automatically', 
     // April: release +200. Run the batch.
     //   -> assert one payout of 150, claiming all three entries.
     // No manual step anywhere.
+    //
+    // Setup only, for the reason given in inv-25: a partial fake so §10.3's
+    // attempt dispatch cannot settle the April payout this test weighs.
+    Bus::fake([SendPayoutAttempt::class]);
+
     $instructor = 41;
 
     $this->travelTo(RecognitionFixtures::utc('2026-04-01 10:00:00'));

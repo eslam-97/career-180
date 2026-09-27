@@ -25,6 +25,12 @@ use InvalidArgumentException;
  * batch is opened get-or-create (§10.1), so the second run reuses the same
  * frozen cutoff_at and max_entry_id rather than opening a second snapshot. That
  * is both invariant 25 and the recovery path when a claim job is lost.
+ *
+ * §10.3: each claim job starts its own attempt once its own transaction has
+ * committed, so this command is the whole trigger for a payout run and nothing
+ * waits on `payouts:sweep-stranded`. A rerun dispatches the claim jobs again,
+ * but only a claim that CREATES a payout dispatches an attempt, so the reruns
+ * above queue no second send.
  */
 final class PayoutsRun extends Command
 {

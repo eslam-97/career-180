@@ -48,8 +48,9 @@ it('the stranded sweeper re-dispatches a claimed payout with no attempt', functi
         ->assertSuccessful();
 
     // §10.7: "a payout in pending or in_progress with no active attempt and
-    // attempt_count below the ceiling is re-dispatched". This is also the
-    // ordinary road out of the claim (§10.3).
+    // attempt_count below the ceiling is re-dispatched". The fixture claims
+    // through ClaimService directly, so no §10.3 dispatch ever happened for it
+    // — which is exactly the stranded state this recovery path exists for.
     Queue::assertPushed(SendPayoutAttempt::class, fn (SendPayoutAttempt $job) => $job->payoutId === $payout->id);
 });
 
