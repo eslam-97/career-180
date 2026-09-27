@@ -19,7 +19,7 @@ Senior bonus (a student changing plan mid-term) is answered in `ARCHITECTURE.md`
 
 ## Stack
 
-Laravel 11 · PHP 8.4 · MySQL 8.4 · Redis 7 · Filament 3 · Pest · Docker
+Laravel 11 · PHP 8.2+ (built on 8.4) · MySQL 8.4 · Redis 7 · Filament 3 · Pest · Docker
 
 **MySQL 8.0.16+ is required.** Older versions accept `CHECK` constraints and then silently
 ignore them — the schema would look right and enforce nothing.
@@ -42,8 +42,10 @@ docker compose exec mysql mysql -uroot -psecret \
       CREATE DATABASE IF NOT EXISTS revenue_ledger_test;"
 
 php artisan migrate:fresh --seed     # demo data, ~10s
-php artisan make:filament-user
 ```
+
+The seed creates a Filament login: `test@example.com` / `password`. Use
+`php artisan make:filament-user` if you'd rather make your own.
 
 `.env.example` already points at Docker: MySQL on `3307`, Redis on `6380`.
 
@@ -73,16 +75,21 @@ php artisan schedule:work  # release, sweepers, reconciliation
 ## Tests
 
 ```bash
-php artisan test                    # everything, concurrency included
-php artisan test tests/Invariants   # the 33 invariants
-php artisan test tests/Concurrency  # two-connection tests
+php artisan test                    # everything
+php artisan test tests/Invariants   # the invariants that run on one connection
+php artisan test tests/Concurrency  # 12, 19, 23 and part of 17 — these need two
 ./vendor/bin/pint --test
 ```
 
-**154 passed, 18,384 assertions.** Screenshot: `docs/screenshots/tests-passing.png`
+**152 passed, 18,382 assertions.**
 
 **33 named invariants** (`ARCHITECTURE.md` §15) are the definition of done. They were written
 as failing tests before any code existed, and each one names a way money could go wrong.
+
+**The unit-level tests are in `tests/Invariants/Inv01_MoneyTest.php`** — the allocator, the
+basis-point arithmetic and the release calculation, as pure functions with no database. They
+are grouped by invariant rather than by layer, because what they protect is the money
+arithmetic, not a class.
 
 **Rules alone are not enough.** A release calculation that quietly halved every amount would
 pass "never negative", "never above the cap", and the nightly reconciliation — because the
@@ -95,10 +102,17 @@ nothing — the second run sees the first one's work and correctly does nothing.
 `tests/Concurrency/` drive two database connections in a set order and check the second one
 blocks or refuses.
 
-**The critical guards were mutation-tested.** Deleting a `FOR UPDATE`, un-gating a balance
-update, or making the fake provider throw before recording a transfer each turns a specific
-invariant red. Two tests were found to be vacuous this way and rewritten — one passed with
-the lock deleted, because any write to a row locks it anyway.
+**The critical guards were mutation-tested**, and re-checked before submission:
+
+| Break this | Expected | What actually goes red |
+|---|---|---|
+| Remove `lockForUpdate()` from the release service | inv-12 | inv-12a |
+| Move the throw before the transfer is recorded in the fake provider | inv-31 | inv-31 **and** inv-27 |
+
+The second one is worth a look: recording the transfer *after* throwing means a replayed
+idempotency key creates a second transfer, so the provider-dedup invariant fails alongside
+the timeout one. Two tests were also found to be vacuous this way and rewritten — one of
+them passed with the lock deleted, because any write to a row locks it anyway.
 
 ---
 
@@ -187,8 +201,9 @@ subscriptions usually end, not an edge case.
 ### What a prorata refund means
 
 The unused part of the term. Ending access on the refund date stands for what the student is
-still owed. A refund dated outside the term is clamped, not rejected: the money has already
-moved, so refusing to record it would just leave a real refund out of the books.
+still owed. A refund dated outside the term is recorded exactly as given — only the
+end-of-access date it produces is clamped into the term. The money has already moved, so
+refusing to record it would just leave a real refund out of the books.
 
 ### Cancelling is not the same as losing access
 

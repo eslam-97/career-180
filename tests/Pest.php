@@ -45,7 +45,7 @@ function assertNoUnscriptedProviderCalls(): void
 // Most tests: fast, transaction-wrapped.
 uses(TestCase::class, RefreshDatabase::class)
     ->afterEach(fn () => assertNoUnscriptedProviderCalls())
-    ->in('Feature', 'Unit', 'Invariants');
+    ->in('Feature', 'Invariants');
 
 // Concurrency tests MUST NOT use RefreshDatabase. It wraps each test in a
 // transaction on the default connection, so a second connection would never
